@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import * as fs from "fs";
+import * as os from "os";
+import * as upath from "upath";
+import * as readline from "readline";
+
 import * as grpc from "@grpc/grpc-js";
+import * as tail from "tail";
 
 import { CommandResult, runPulumiCmd } from "./cmd";
 import { ConfigMap, ConfigValue } from "./config";
 import { StackAlreadyExistsError } from "./errors";
 import { LanguageServer, maxRPCMessageSize } from "./server";
 import { PulumiFn, Workspace } from "./workspace";
+import { EngineEvent } from "./events";
 
 const langrpc = require("../../proto/language_grpc_pb.js");
 
@@ -102,6 +109,28 @@ export class Stack {
                 throw new Error(`unexpected Stack creation mode: ${mode}`);
         }
     }
+    // Try for up to 10s to start tailing the file, invoking the callback once per line.  Returns
+    // a promise for a callback to invoke to stop tailing the file.
+    private async readLines(path: string, callback: (line: string) => void): Promise<() => void> {
+        let n = 0;
+        while (true) {
+            try {
+                // console.log(path);
+                const eventLogTail = new tail.Tail(path);
+                eventLogTail.on("line", ev => {
+                    // console.log(ev);
+                    callback(ev);
+                });
+                return () => eventLogTail.unwatch();
+            } catch (err) {
+                // On the 100th attempt (waiting 100ms per attempt), throw.
+                if (n++ > 100) {
+                    throw err;
+                }
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+    }
     /**
      * Creates or updates the resources in a stack by executing the program in the Workspace.
      * https://www.pulumi.com/docs/reference/cli/pulumi_up/
@@ -114,6 +143,7 @@ export class Stack {
         let program = this.workspace.program;
         await this.workspace.selectStack(this.name);
 
+        let stopEventListenerPromise: Promise<() => void> | undefined;
         if (opts) {
             if (opts.program) {
                 program = opts.program;
@@ -139,6 +169,16 @@ export class Stack {
             }
             if (opts.parallel) {
                 args.push("--parallel", opts.parallel.toString());
+            }
+            if (opts.onEvent) {
+                const logDir = fs.mkdtempSync(upath.joinSafe(os.tmpdir(), "automation-logs-"));
+                const logFile = upath.joinSafe(logDir, "eventlog.txt");
+                args.push("--event-log", logFile);
+                const onEvent = opts.onEvent;
+                stopEventListenerPromise = this.readLines(logFile, (line) => {
+                    const event = JSON.parse(line);
+                    onEvent(event);
+                });
             }
         }
 
@@ -170,6 +210,7 @@ export class Stack {
 
         args.push("--exec-kind", kind);
         const upResult = await this.runPulumiCmd(args, opts?.onOutput);
+        (await stopEventListenerPromise)?.();
         onExit(upResult.code);
         // TODO: do this in parallel after this is fixed https://github.com/pulumi/pulumi/issues/3877
         const outputs = await this.outputs();
@@ -195,6 +236,7 @@ export class Stack {
         let program = this.workspace.program;
         await this.workspace.selectStack(this.name);
 
+        let stopEventListenerPromise: Promise<() => void> | undefined;
         if (opts) {
             if (opts.program) {
                 program = opts.program;
@@ -220,6 +262,16 @@ export class Stack {
             }
             if (opts.parallel) {
                 args.push("--parallel", opts.parallel.toString());
+            }
+            if (opts.onEvent) {
+                const logDir = fs.mkdtempSync(upath.joinSafe(os.tmpdir(), "automation-logs-"));
+                const logFile = upath.joinSafe(logDir, "eventlog.txt");
+                args.push("--event-log", logFile);
+                const onEvent = opts.onEvent;
+                stopEventListenerPromise = this.readLines(logFile, (line) => {
+                    const event = JSON.parse(line);
+                    onEvent(event);
+                });
             }
         }
 
@@ -252,6 +304,7 @@ export class Stack {
         args.push("--exec-kind", kind);
         const preResult = await this.runPulumiCmd(args);
         onExit(preResult.code);
+        (await stopEventListenerPromise)?.();
         const summary = await this.info();
         const result: PreviewResult = {
             stdout: preResult.stdout,
@@ -270,6 +323,7 @@ export class Stack {
         const args = ["refresh", "--yes", "--skip-preview"];
         await this.workspace.selectStack(this.name);
 
+        let finalizer: Promise<() => void> | undefined;
         if (opts) {
             if (opts.message) {
                 args.push("--message", opts.message);
@@ -285,9 +339,20 @@ export class Stack {
             if (opts.parallel) {
                 args.push("--parallel", opts.parallel.toString());
             }
+            if (opts.onEvent) {
+                const logDir = fs.mkdtempSync(upath.joinSafe(os.tmpdir(), "automation-logs-"));
+                const logFile = upath.joinSafe(logDir, "eventlog.txt");
+                args.push("--event-log", logFile);
+                const onEvent = opts.onEvent;
+                finalizer = this.readLines(logFile, (line) => {
+                    const event = JSON.parse(line);
+                    onEvent(event);
+                });
+            }
         }
 
         const refResult = await this.runPulumiCmd(args, opts?.onOutput);
+        (await finalizer)?.();
         const summary = await this.info();
         const result: RefreshResult = {
             stdout: refResult.stdout,
@@ -305,6 +370,7 @@ export class Stack {
         const args = ["destroy", "--yes", "--skip-preview"];
         await this.workspace.selectStack(this.name);
 
+        let stopEventListenerPromise: Promise<() => void> | undefined;
         if (opts) {
             if (opts.message) {
                 args.push("--message", opts.message);
@@ -320,9 +386,20 @@ export class Stack {
             if (opts.parallel) {
                 args.push("--parallel", opts.parallel.toString());
             }
+            if (opts.onEvent) {
+                const logDir = fs.mkdtempSync(upath.joinSafe(os.tmpdir(), "automation-logs-"));
+                const logFile = upath.joinSafe(logDir, "eventlog.txt");
+                args.push("--event-log", logFile);
+                const onEvent = opts.onEvent;
+                stopEventListenerPromise = this.readLines(logFile, (line) => {
+                    const event = JSON.parse(line);
+                    onEvent(event);
+                });
+            }
         }
 
         const preResult = await this.runPulumiCmd(args, opts?.onOutput);
+        (await stopEventListenerPromise)?.();
         const summary = await this.info();
         const result: DestroyResult = {
             stdout: preResult.stdout,
@@ -425,7 +502,9 @@ export class Stack {
         return history[0];
     }
     private async runPulumiCmd(args: string[], onOutput?: (out: string) => void): Promise<CommandResult> {
-        let envs: { [key: string]: string } = {};
+        let envs: { [key: string]: string } = {
+            "PULUMI_DEBUG_COMMANDS": "true",
+        };
         const pulumiHome = this.workspace.pulumiHome;
         if (pulumiHome) {
             envs["PULUMI_HOME"] = pulumiHome;
@@ -553,6 +632,7 @@ export interface UpOptions {
     target?: string[];
     targetDependents?: boolean;
     onOutput?: (out: string) => void;
+    onEvent?: (event: EngineEvent) => void;
     program?: PulumiFn;
 }
 
@@ -567,6 +647,7 @@ export interface PreviewOptions {
     target?: string[];
     targetDependents?: boolean;
     program?: PulumiFn;
+    onEvent?: (event: EngineEvent) => void;
 }
 
 /**
@@ -578,6 +659,7 @@ export interface RefreshOptions {
     expectNoChanges?: boolean;
     target?: string[];
     onOutput?: (out: string) => void;
+    onEvent?: (event: EngineEvent) => void;
 }
 
 /**
@@ -589,6 +671,7 @@ export interface DestroyOptions {
     target?: string[];
     targetDependents?: boolean;
     onOutput?: (out: string) => void;
+    onEvent?: (event: EngineEvent) => void;
 }
 
 const execKind = {
