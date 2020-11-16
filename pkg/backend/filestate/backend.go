@@ -408,7 +408,7 @@ func (b *localBackend) PackPolicies(
 }
 
 func (b *localBackend) Preview(ctx context.Context, stack backend.Stack,
-	op backend.UpdateOperation) (engine.ResourceChanges, result.Result) {
+	op backend.UpdateOperation) (engine.Plan, engine.ResourceChanges, result.Result) {
 	// We can skip PreviewThenPromptThenExecute and just go straight to Execute.
 	opts := backend.ApplierOptions{
 		DryRun:   true,
@@ -452,7 +452,7 @@ func (b *localBackend) Watch(ctx context.Context, stack backend.Stack,
 func (b *localBackend) apply(
 	ctx context.Context, kind apitype.UpdateKind, stack backend.Stack,
 	op backend.UpdateOperation, opts backend.ApplierOptions,
-	events chan<- engine.Event) (engine.ResourceChanges, result.Result) {
+	events chan<- engine.Event) (engine.Plan, engine.ResourceChanges, result.Result) {
 
 	stackRef := stack.Ref()
 	stackName := stackRef.Name()
@@ -467,7 +467,7 @@ func (b *localBackend) apply(
 	// Start the update.
 	update, err := b.newUpdate(stackName, op)
 	if err != nil {
-		return nil, result.FromError(err)
+		return nil, nil, result.FromError(err)
 	}
 
 	// Spawn a display loop to show events on the CLI.
@@ -508,19 +508,20 @@ func (b *localBackend) apply(
 
 	// Perform the update
 	start := time.Now().Unix()
+	var plan engine.Plan
 	var changes engine.ResourceChanges
 	var updateRes result.Result
 	switch kind {
 	case apitype.PreviewUpdate:
-		changes, updateRes = engine.Update(update, engineCtx, op.Opts.Engine, true)
+		plan, changes, updateRes = engine.Update(update, engineCtx, op.Opts.Engine, true)
 	case apitype.UpdateUpdate:
-		changes, updateRes = engine.Update(update, engineCtx, op.Opts.Engine, opts.DryRun)
+		_, changes, updateRes = engine.Update(update, engineCtx, op.Opts.Engine, opts.DryRun)
 	case apitype.ResourceImportUpdate:
-		changes, updateRes = engine.Import(update, engineCtx, op.Opts.Engine, op.Imports, opts.DryRun)
+		_, changes, updateRes = engine.Import(update, engineCtx, op.Opts.Engine, op.Imports, opts.DryRun)
 	case apitype.RefreshUpdate:
-		changes, updateRes = engine.Refresh(update, engineCtx, op.Opts.Engine, opts.DryRun)
+		_, changes, updateRes = engine.Refresh(update, engineCtx, op.Opts.Engine, opts.DryRun)
 	case apitype.DestroyUpdate:
-		changes, updateRes = engine.Destroy(update, engineCtx, op.Opts.Engine, opts.DryRun)
+		_, changes, updateRes = engine.Destroy(update, engineCtx, op.Opts.Engine, opts.DryRun)
 	default:
 		contract.Failf("Unrecognized update kind: %s", kind)
 	}
@@ -564,16 +565,16 @@ func (b *localBackend) apply(
 
 	if updateRes != nil {
 		// We swallow saveErr and backupErr as they are less important than the updateErr.
-		return changes, updateRes
+		return plan, changes, updateRes
 	}
 
 	if saveErr != nil {
 		// We swallow backupErr as it is less important than the saveErr.
-		return changes, result.FromError(errors.Wrap(saveErr, "saving update info"))
+		return plan, changes, result.FromError(errors.Wrap(saveErr, "saving update info"))
 	}
 
 	if backupErr != nil {
-		return changes, result.FromError(errors.Wrap(backupErr, "saving backup"))
+		return plan, changes, result.FromError(errors.Wrap(backupErr, "saving backup"))
 	}
 
 	// Make sure to print a link to the stack's checkpoint before exiting.
@@ -602,7 +603,7 @@ func (b *localBackend) apply(
 				colors.Underline+colors.BrightBlue+"%s"+colors.Reset+"\n"), link)
 	}
 
-	return changes, nil
+	return plan, changes, nil
 }
 
 // query executes a query program against the resource outputs of a locally hosted stack.

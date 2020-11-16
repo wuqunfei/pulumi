@@ -45,8 +45,10 @@ import (
 	"github.com/pulumi/pulumi/pkg/v2/secrets/passphrase"
 	"github.com/pulumi/pulumi/pkg/v2/util/cancel"
 	"github.com/pulumi/pulumi/pkg/v2/util/tracing"
+	"github.com/pulumi/pulumi/sdk/v2/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/constant"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/diag/colors"
+	"github.com/pulumi/pulumi/sdk/v2/go/common/resource/config"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/util/ciutil"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/util/cmdutil"
 	"github.com/pulumi/pulumi/sdk/v2/go/common/util/contract"
@@ -785,4 +787,32 @@ func checkDeploymentVersionError(err error, stackName string) error {
 			"Please update your version of the Pulumi CLI", stackName)
 	}
 	return errors.Wrap(err, "could not deserialize deployment")
+}
+
+func writePlan(path string, plan engine.Plan, enc config.Encrypter, showSecrets bool) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer contract.IgnoreClose(f)
+
+	deploymentPlan, err := stack.SerializePlan(plan, enc, showSecrets)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(f).Encode(deploymentPlan)
+}
+
+func readPlan(path string, dec config.Decrypter, enc config.Encrypter) (engine.Plan, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer contract.IgnoreClose(f)
+
+	var deploymentPlan apitype.DeploymentPlanV1
+	if err := json.NewDecoder(f).Decode(&deploymentPlan); err != nil {
+		return nil, err
+	}
+	return stack.DeserializePlan(deploymentPlan, dec, enc)
 }
