@@ -42,7 +42,7 @@ func TestPendingOperationsPlan(t *testing.T) {
 		},
 	})
 
-	_, err := NewPlan(&plugin.Context{}, &Target{}, snap, &fixedSource{}, nil, false, nil)
+	_, err := NewPlan(&plugin.Context{}, &Target{}, snap, nil, &fixedSource{}, nil, false, nil)
 	if !assert.Error(t, err) {
 		t.FailNow()
 	}

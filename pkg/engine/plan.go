@@ -16,7 +16,7 @@ package engine
 
 import (
 	"context"
-	"sync"
+	"time"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -132,8 +132,8 @@ type planSourceFunc func(
 	client deploy.BackendClient, opts planOptions, proj *workspace.Project, pwd, main string,
 	target *deploy.Target, plugctx *plugin.Context, dryRun bool) (deploy.Source, error)
 
-// plan just uses the standard logic to parse arguments, options, and to create a snapshot and plan.
-func plan(ctx *Context, info *planContext, opts planOptions, dryRun bool) (*planResult, error) {
+// newPlanner creates a new planner with the given context and options.
+func newPlanner(ctx *Context, info *planContext, opts planOptions, dryRun bool) (*planner, error) {
 	contract.Assert(info != nil)
 	contract.Assert(info.Update != nil)
 	contract.Assert(opts.SourceFunc != nil)
@@ -165,7 +165,7 @@ func plan(ctx *Context, info *planContext, opts planOptions, dryRun bool) (*plan
 	var plan *deploy.Plan
 	if !opts.isImport {
 		plan, err = deploy.NewPlan(
-			plugctx, target, target.Snapshot, source, localPolicyPackPaths, dryRun, ctx.BackendClient)
+			plugctx, target, target.Snapshot, opts.Plan, source, localPolicyPackPaths, dryRun, ctx.BackendClient)
 	} else {
 		_, defaultProviderVersions, pluginErr := installPlugins(proj, pwd, main, target, plugctx)
 		if pluginErr != nil {
@@ -185,7 +185,7 @@ func plan(ctx *Context, info *planContext, opts planOptions, dryRun bool) (*plan
 		contract.IgnoreClose(plugctx)
 		return nil, err
 	}
-	return &planResult{
+	return &planner{
 		Ctx:     info,
 		Plugctx: plugctx,
 		Plan:    plan,
@@ -193,47 +193,64 @@ func plan(ctx *Context, info *planContext, opts planOptions, dryRun bool) (*plan
 	}, nil
 }
 
-type planResult struct {
+type planner struct {
 	Ctx     *planContext    // plan context information.
 	Plugctx *plugin.Context // the context containing plugins and their state.
 	Plan    *deploy.Plan    // the plan created by this command.
 	Options planOptions     // the options used during planning.
 }
 
-// Chdir changes the directory so that all operations from now on are relative to the project we are working with.
-// It returns a function that, when run, restores the old working directory.
-func (planResult *planResult) Chdir() (func(), error) {
-	return fsutil.Chdir(planResult.Plugctx.Pwd)
+type runActions interface {
+	deploy.Events
+
+	Changes() ResourceChanges
+	MaybeCorrupt() bool
 }
 
-// Walk enumerates all steps in the plan, calling out to the provided action at each step.  It returns four things: the
+// run enumerates all steps in the plan, calling out to the provided action at each step.  It returns four things: the
 // resulting Snapshot, no matter whether an error occurs or not; an error, if something went wrong; the step that
 // failed, if the error is non-nil; and finally the state of the resource modified in the failing step.
-func (planResult *planResult) Walk(cancelCtx *Context, events deploy.Events, preview bool) result.Result {
+func (planner *planner) run(cancelCtx *Context, actions runActions, policyPacks map[string]string,
+	preview bool) (Plan, ResourceChanges, result.Result) {
+
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
+	// Change into the plugin context's working directory.
+	chdir, err := fsutil.Chdir(planner.Plugctx.Pwd)
+	if err != nil {
+		return nil, nil, result.FromError(err)
+	}
+	defer chdir()
+
 	// Inject our opentracing span into the context.
-	if planResult.Ctx.TracingSpan != nil {
-		ctx = opentracing.ContextWithSpan(ctx, planResult.Ctx.TracingSpan)
+	if planner.Ctx.TracingSpan != nil {
+		ctx = opentracing.ContextWithSpan(ctx, planner.Ctx.TracingSpan)
 	}
 
+	// Emit an appropriate prelude event.
+	planner.Options.Events.preludeEvent(preview, planner.Ctx.Update.GetTarget().Config)
+
+	// Execute the plan.
+	start := time.Now()
+
 	done := make(chan bool)
+	var plan map[resource.URN]*deploy.ResourcePlan
 	var walkResult result.Result
 	go func() {
 		opts := deploy.Options{
-			Events:            events,
-			Parallel:          planResult.Options.Parallel,
-			Refresh:           planResult.Options.Refresh,
-			RefreshOnly:       planResult.Options.isRefresh,
-			RefreshTargets:    planResult.Options.RefreshTargets,
-			ReplaceTargets:    planResult.Options.ReplaceTargets,
-			DestroyTargets:    planResult.Options.DestroyTargets,
-			UpdateTargets:     planResult.Options.UpdateTargets,
-			TargetDependents:  planResult.Options.TargetDependents,
-			TrustDependencies: planResult.Options.trustDependencies,
-			UseLegacyDiff:     planResult.Options.UseLegacyDiff,
+			Events:            actions,
+			Parallel:          planner.Options.Parallel,
+			Refresh:           planner.Options.Refresh,
+			RefreshOnly:       planner.Options.isRefresh,
+			RefreshTargets:    planner.Options.RefreshTargets,
+			ReplaceTargets:    planner.Options.ReplaceTargets,
+			DestroyTargets:    planner.Options.DestroyTargets,
+			UpdateTargets:     planner.Options.UpdateTargets,
+			TargetDependents:  planner.Options.TargetDependents,
+			TrustDependencies: planner.Options.trustDependencies,
+			UseLegacyDiff:     planner.Options.UseLegacyDiff,
 		}
-		walkResult = planResult.Plan.Execute(ctx, opts, preview)
+		plan, walkResult = planner.Plan.Execute(ctx, opts, preview)
 		close(done)
 	}()
 
@@ -248,152 +265,27 @@ func (planResult *planResult) Walk(cancelCtx *Context, events deploy.Events, pre
 		}
 	}()
 
+	// Wait for the plan to finish executing or for the user to terminate the run.
+	var res result.Result
 	select {
 	case <-cancelCtx.Cancel.Terminated():
-		return result.WrapIfNonNil(cancelCtx.Cancel.TerminateErr())
+		res = result.WrapIfNonNil(cancelCtx.Cancel.TerminateErr())
 
 	case <-done:
-		return walkResult
-	}
-}
-
-func (planResult *planResult) Close() error {
-	return planResult.Plugctx.Close()
-}
-
-// printPlan prints the plan's result to the plan's Options.Events stream.
-func printPlan(ctx *Context, planResult *planResult, dryRun bool, policies map[string]string,
-) (ResourceChanges, result.Result) {
-
-	planResult.Options.Events.preludeEvent(dryRun, planResult.Ctx.Update.GetTarget().Config)
-
-	// Walk the plan's steps and and pretty-print them out.
-	actions := newPlanActions(planResult.Options)
-	res := planResult.Walk(ctx, actions, true)
-
-	// Emit an event with a summary of operation counts.
-	changes := ResourceChanges(actions.Ops)
-	planResult.Options.Events.previewSummaryEvent(changes, policies)
-
-	if res != nil {
-
-		if res.IsBail() {
-			return nil, res
-		}
-
-		return nil, result.Error("an error occurred while advancing the preview")
+		res = walkResult
 	}
 
-	return changes, nil
+	duration := time.Since(start)
+	changes := actions.Changes()
+
+	// Emit a summary event.
+	planner.Options.Events.summaryEvent(preview, actions.MaybeCorrupt(), duration, changes, policyPacks)
+
+	return Plan(plan), changes, res
 }
 
-type planActions struct {
-	Ops     map[deploy.StepOp]int
-	Opts    planOptions
-	Seen    map[resource.URN]deploy.Step
-	MapLock sync.Mutex
-}
-
-func shouldReportStep(step deploy.Step, opts planOptions) bool {
-	return step.Op() != deploy.OpRemovePendingReplace &&
-		(opts.reportDefaultProviderSteps || !isDefaultProviderStep(step))
-}
-
-func newPlanActions(opts planOptions) *planActions {
-	return &planActions{
-		Ops:  make(map[deploy.StepOp]int),
-		Opts: opts,
-		Seen: make(map[resource.URN]deploy.Step),
-	}
-}
-
-func (acts *planActions) OnResourceStepPre(step deploy.Step) (interface{}, error) {
-	acts.MapLock.Lock()
-	acts.Seen[step.URN()] = step
-	acts.MapLock.Unlock()
-
-	// Skip reporting if necessary.
-	if !shouldReportStep(step, acts.Opts) {
-		return nil, nil
-	}
-
-	acts.Opts.Events.resourcePreEvent(step, true /*planning*/, acts.Opts.Debug)
-
-	return nil, nil
-}
-
-func (acts *planActions) OnResourceStepPost(ctx interface{},
-	step deploy.Step, status resource.Status, err error) error {
-	acts.MapLock.Lock()
-	assertSeen(acts.Seen, step)
-	acts.MapLock.Unlock()
-
-	reportStep := shouldReportStep(step, acts.Opts)
-
-	if err != nil {
-		// We always want to report a failure. If we intend to elide this step overall, though, we report it as a
-		// global message.
-		reportedURN := resource.URN("")
-		if reportStep {
-			reportedURN = step.URN()
-		}
-
-		acts.Opts.Diag.Errorf(diag.GetPreviewFailedError(reportedURN), err)
-	} else if reportStep {
-		op, record := step.Op(), step.Logical()
-		if acts.Opts.isRefresh && op == deploy.OpRefresh {
-			// Refreshes are handled specially.
-			op, record = step.(*deploy.RefreshStep).ResultOp(), true
-		}
-
-		if step.Op() == deploy.OpRead {
-			record = ShouldRecordReadStep(step)
-		}
-
-		// Track the operation if shown and/or if it is a logically meaningful operation.
-		if record {
-			acts.MapLock.Lock()
-			acts.Ops[op]++
-			acts.MapLock.Unlock()
-		}
-
-		acts.Opts.Events.resourceOutputsEvent(op, step, true /*planning*/, acts.Opts.Debug)
-	}
-
-	return nil
-}
-
-func ShouldRecordReadStep(step deploy.Step) bool {
-	contract.Assertf(step.Op() == deploy.OpRead, "Only call this on a Read step")
-
-	// If reading a resource didn't result in any change to the resource, we then want to
-	// record this as a 'same'.  That way, when things haven't actually changed, but a user
-	// app did any 'reads' these don't show up in the resource summary at the end.
-	return step.Old() != nil &&
-		step.New() != nil &&
-		step.Old().Outputs != nil &&
-		step.New().Outputs != nil &&
-		step.Old().Outputs.Diff(step.New().Outputs) != nil
-}
-
-func (acts *planActions) OnResourceOutputs(step deploy.Step) error {
-	acts.MapLock.Lock()
-	assertSeen(acts.Seen, step)
-	acts.MapLock.Unlock()
-
-	// Skip reporting if necessary.
-	if !shouldReportStep(step, acts.Opts) {
-		return nil
-	}
-
-	// Print the resource outputs separately.
-	acts.Opts.Events.resourceOutputsEvent(step.Op(), step, true /*planning*/, acts.Opts.Debug)
-
-	return nil
-}
-
-func (acts *planActions) OnPolicyViolation(urn resource.URN, d plugin.AnalyzeDiagnostic) {
-	acts.Opts.Events.policyViolationEvent(urn, d)
+func (planner *planner) Close() error {
+	return planner.Plugctx.Close()
 }
 
 func assertSeen(seen map[resource.URN]deploy.Step, step deploy.Step) {

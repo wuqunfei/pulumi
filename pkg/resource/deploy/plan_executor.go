@@ -113,7 +113,7 @@ func (pe *planExecutor) reportError(urn resource.URN, err error) {
 
 // Execute executes a plan to completion, using the given cancellation context and running a preview
 // or update.
-func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview bool) result.Result {
+func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview bool) (map[resource.URN]*ResourcePlan, result.Result) {
 	// Set up a goroutine that will signal cancellation to the plan's plugins if the caller context is cancelled. We do
 	// not hang this off of the context we create below because we do not want the failure of a single step to cause
 	// other steps to fail.
@@ -140,10 +140,10 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 	// Before doing anything else, optionally refresh each resource in the base checkpoint.
 	if opts.Refresh {
 		if res := pe.refresh(callerCtx, opts, preview); res != nil {
-			return res
+			return nil, res
 		}
 		if opts.RefreshOnly {
-			return nil
+			return nil, nil
 		}
 	}
 
@@ -155,10 +155,10 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 	replaceTargetsOpt := createTargetMap(opts.ReplaceTargets)
 	destroyTargetsOpt := createTargetMap(opts.DestroyTargets)
 	if res := pe.checkTargets(opts.ReplaceTargets, OpReplace); res != nil {
-		return res
+		return nil, res
 	}
 	if res := pe.checkTargets(opts.DestroyTargets, OpDelete); res != nil {
-		return res
+		return nil, res
 	}
 
 	if (updateTargetsOpt != nil || replaceTargetsOpt != nil) && destroyTargetsOpt != nil {
@@ -168,7 +168,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 	// Begin iterating the source.
 	src, res := pe.plan.source.Iterate(callerCtx, opts, pe.plan)
 	if res != nil {
-		return res
+		return nil, res
 	}
 
 	// Set up a step generator for this plan.
@@ -176,7 +176,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 
 	// Retire any pending deletes that are currently present in this plan.
 	if res := pe.retirePendingDeletes(callerCtx, opts, preview); res != nil {
-		return res
+		return nil, res
 	}
 
 	// Derive a cancellable context for this plan. We will only cancel this context if some piece of the plan's
@@ -266,7 +266,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 	}
 
 	if res != nil && res.IsBail() {
-		return res
+		return nil, res
 	}
 
 	// If the step generator and step executor were both successful, then we send all the resources
@@ -278,7 +278,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 				logging.V(4).Infof("planExecutor.Execute(...): error analyzing resources: %v", resErr)
 				pe.reportError("", resErr)
 			}
-			return result.Bail()
+			return nil, result.Bail()
 		}
 	}
 
@@ -287,13 +287,13 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 		// TODO(cyrusn): We seem to be losing any information about the original 'res's errors.  Should
 		// we be doing a merge here?
 		pe.reportExecResult("failed", preview)
-		return result.Bail()
+		return nil, result.Bail()
 	} else if canceled {
 		pe.reportExecResult("canceled", preview)
-		return result.Bail()
+		return nil, result.Bail()
 	}
 
-	return res
+	return pe.plan.newResourcePlans, res
 }
 
 func (pe *planExecutor) performDeletes(
@@ -429,9 +429,9 @@ func (pe *planExecutor) retirePendingDeletes(callerCtx context.Context, opts Opt
 }
 
 // import imports a list of resources into a stack.
-func (pe *planExecutor) importResources(callerCtx context.Context, opts Options, preview bool) result.Result {
+func (pe *planExecutor) importResources(callerCtx context.Context, opts Options, preview bool) (map[resource.URN]*ResourcePlan, result.Result) {
 	if len(pe.plan.imports) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Create an executor for this import.
@@ -453,12 +453,12 @@ func (pe *planExecutor) importResources(callerCtx context.Context, opts Options,
 
 	if res != nil || stepExec.Errored() {
 		pe.reportExecResult("failed", preview)
-		return result.Bail()
+		return nil, result.Bail()
 	} else if canceled {
 		pe.reportExecResult("canceled", preview)
-		return result.Bail()
+		return nil, result.Bail()
 	}
-	return nil
+	return pe.plan.newResourcePlans, nil
 }
 
 // refresh refreshes the state of the base checkpoint file for the current plan in memory.
