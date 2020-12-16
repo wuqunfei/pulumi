@@ -262,15 +262,15 @@ type testInstanceResourceInput interface {
 	ToTestInstanceResourceOutputWithContext(ctx context.Context) testInstanceResourceOutput
 }
 
-func (testInstanceResource) ElementType() reflect.Type {
+func (*testInstanceResource) ElementType() reflect.Type {
 	return reflect.TypeOf((*testInstanceResource)(nil)).Elem()
 }
 
-func (i testInstanceResource) ToTestInstanceResourceOutput() testInstanceResourceOutput {
+func (i *testInstanceResource) ToTestInstanceResourceOutput() testInstanceResourceOutput {
 	return i.ToTestInstanceResourceOutputWithContext(context.Background())
 }
 
-func (i testInstanceResource) ToTestInstanceResourceOutputWithContext(ctx context.Context) testInstanceResourceOutput {
+func (i *testInstanceResource) ToTestInstanceResourceOutputWithContext(ctx context.Context) testInstanceResourceOutput {
 	return ToOutputWithContext(ctx, i).(testInstanceResourceOutput)
 }
 
@@ -279,7 +279,7 @@ type testInstanceResourceOutput struct {
 }
 
 func (testInstanceResourceOutput) ElementType() reflect.Type {
-	return reflect.TypeOf((*testInstanceResourceOutput)(nil)).Elem()
+	return reflect.TypeOf((*testInstanceResource)(nil)).Elem()
 }
 
 func (o testInstanceResourceOutput) ToTestInstanceResourceOutput() testInstanceResourceOutput {
@@ -350,7 +350,7 @@ func TestRegisterResourceWithResourceReferences(t *testing.T) {
 
 		var mycustom testMyCustomResource
 		err = ctx.RegisterResource("pkg:index:MyCustom", "mycustom", &testMyCustomResourceInputs{
-			Instance: instance,
+			Instance: &instance,
 		}, &mycustom)
 		assert.NoError(t, err)
 

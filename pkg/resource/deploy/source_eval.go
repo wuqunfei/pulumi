@@ -532,7 +532,7 @@ func (rm *resmon) SupportsFeature(ctx context.Context,
 		hasSupport = true
 	case "resourceReferences":
 		// TODO: Temporarily disabling resource ref support (https://github.com/pulumi/pulumi-kubernetes/issues/1405)
-		hasSupport = false
+		hasSupport = true
 
 		// Allow the resource reference feature to be disabled by explicitly setting an env var.
 		if v, ok := os.LookupEnv("PULUMI_DISABLE_RESOURCE_REFERENCES"); ok && cmdutil.IsTruthy(v) {
